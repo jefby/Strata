@@ -58,11 +58,13 @@ Strata 在普通 PC（NVIDIA/AMD 显卡 + 系统内存）上运行 **Qwen3.8-Fla
 src/              C++/CUDA/HIP 引擎（真正跑模型的只有这里）
   program/generate.cpp   驱动器 —— 把所有组件组合成一个 token
   core/                  device、session、layer、graph、weights、专家缓存、
-                         remote experts、mtp、会话内存/缓存/快照、layout、load
+                         remote experts、peer_experts（多 GPU 第二专家层）、
+                         mtp、会话内存/缓存/快照、layout、load
   kernels/               各量化（IQ2/3/5、S2、Q4/Q8、prefill 用 MMVQ）的
                          解量化 + GEMV/GEMM，GDN 循环核、QSA（量化移位 attention）核，
                          （cuda/ 与 cpu/ AVX2/AVX512 变体）
-  prefill/               批量提示词路径（mmq、gemm、native 核、staging）
+  prefill/               批量提示词路径（mmq、gemm、native 核、fused MoE
+                         moe_fused、staging）
   spec/                  投机解码：MTP 草稿器 + 后缀草稿器 + 控制器
   ngram/                 SSD n-gram 查找表读取器
   plan/                  CPU+GPU 内存规划器（strata-plan）
@@ -79,8 +81,11 @@ serve/              Python（只用标准库，无框架）
                          About、app.js、CSS、fonts、sprite.svg
 
 setup.py             一键安装器（检查 PC、选模型、下载、编译、写
-                     run-<model>.bat/.sh + strata.json、启动模型）
+                     run-<model>.bat/.sh + strata.json、启动模型）；
+                     `setup --update` 只更新、不启动
 START-HERE.bat / setup.sh   入口点，调用 setup.py
+UPDATE.bat / update.sh      只更新代码/引擎/各模型配置与 draft 子集（git 克隆
+                            时先 git pull），不启动模型（#475）
 chat.py               针对运行中的服务器的小终端客户端
 
 tools/               辅助脚本：calibrate、gguf 读写、MTP 抓取/校验、
@@ -128,6 +133,7 @@ embed_row(token) → 48 个捕获的层图（CPU 专家池藏在"门铃"后）
 | `remote_experts.cpp` | CPU 计算的专家（"并行"路径） |
 | `mtp.cpp` | 多 token 预测草稿层 |
 | `native_head.cpp` | LM 头（草稿 logit + 主 logit） |
+| `peer_experts.cpp` / `peer_experts.hpp` | 多 GPU：`--peer-device N` 时第二张卡上的专家层（行经 P2P 映射内存） |
 | `pinned.{c,cu,cpp}` | 用于 DMA 的 pinned 宿主内存 |
 | `conversation_memory / snapshot / cache / state` | KV 状态、停泊/恢复、缓存增长 |
 
@@ -136,8 +142,10 @@ embed_row(token) → 48 个捕获的层图（CPU 专家池藏在"门铃"后）
 对 GGUF 用到的每种量化（IQ2/3/5、S2、Q4/Q8、prefill 用 MMVQ、BF16）的解量化
 + GEMV/GEMM，**GDN** 循环核与 **QSA**（量化移位 attention）核，以及 CPU
 AVX2/AVX512 专家核。每个 GPU/CPU 内核都有对应的 `*_parity.cpp` 测试，证明在同一
-输入上与参考实现**逐位一致**（`tests/` + `bench/`）。这套 parity 纪律让
-"同样答案、更快"成立。
+输入上与参考实现**逐位一致**（`tests/` + `bench/`）。0.1.38 起新增一批 parity
+（`decode_cluster_parity`、`native_grouped_parity`、`qsa_topk_active_parity`、
+`prefill/gdn_rec_parity`）与 fused prefill 的测试（`tests/cuda/prefill_fused_*.cpp`）。
+这套 parity 纪律让"同样答案、更快"成立。
 
 ### 3.4 Prefill（`src/prefill/`）
 
@@ -148,6 +156,8 @@ AVX2/AVX512 专家核。每个 GPU/CPU 内核都有对应的 `*_parity.cpp` 测�
 - **MMQ / native 批量** —— 针对 Q4_K/Q5_K/Q5_1 专家的批量解量化+GEMM。
 - **MTP 批量**（`on_chunk`）—— 对提示词的每个 cell 一次批量出草稿 token，复用
   提示词的 KV。
+- **Fused MoE 缓冲（0.1.38 更快提示）** —— `moe_fused.cu` / `moe_fused_iq.cu` 把
+  各层 MoE 缓冲合并到一处；只在 native 核覆盖**所有**层时才用更小的缓冲。
 - **KV 流式** —— 超过 64K 上下文时 KV 缓存放在 RAM，只把 attention 窗口放显存。
 
 ### 3.5 投机解码（`src/spec/`）
@@ -255,6 +265,22 @@ model 名 → alias → 真实模型，计算**推理预算**（`reasoning_effor
 
 两种传输都用标准库实现 —— **无 MCP SDK**。
 
+### 4.5 安全（f-138 系列，引擎 0.1.38）
+
+服务器默认对网络不信任，多层防护（`serve/test_security.py` 覆盖）：
+
+- **DNS 重绑定防护（Host 检查）** —— 没有 API 键时，*每个*请求（任意方法）
+  先过 Host 头校验：服务器只响应配置的名字（`allowed_hosts`，或
+  `$STRATA_ALLOWED_HOSTS`；默认只有回环名）。重绑定页把恶意域名指向本机端口
+  也进不来。
+- **配了 API 键则跳过 Host 检查** —— 重绑定页无法携带有效键认证，所以设了
+  key 就免检，方便反向代理/隧道（其 Host 可能不同，如 `https://strata.example.com`）。
+- **跨站浏览器请求** —— 带 `Origin` 的浏览器请求，`Origin` 必须命名允许的
+  页面（配置的 `trusted_origins` / `cors_origins`）；否则被拒，防止跨站页面
+  无键访问 API 烧显存。无 `Origin`（curl、SDK、其他服务器）不受此限。
+- **CORS** —— 仅当路径是 `/v1/*` 且请求的 Origin 在 `cors_origins` 时，
+  回 `Access-Control-Allow-Origin`。
+
 ## 5. 安装 / 安装器（`setup.py`、`START-HERE.bat`、`setup.sh`）
 
 一次、可恢复、默认非交互的一键安装器。它**检查 PC**、**选适配的模型**、**安装**、
@@ -281,7 +307,16 @@ model 名 → alias → 真实模型，计算**推理预算**（`reasoning_effor
 常用旗标：`--yes`（接受推荐）、`--setup`（加/改一个模型）、`--no-start`、
 `--build`、`--host 0.0.0.0 --api-key <secret>`（网络访问 —— **必须配 key**）、
 `--low-ram resident|mmap`（大卡、少 RAM）、`--calibrate`（5–10 分钟调优，
-`tools/calibrate.py`）。
+`tools/calibrate.py`）、`--peer-device N`（多 GPU：第二张卡作专家缓存层，
+还需 `--expert-profile`）。
+
+**更新（不启动）**：`UPDATE.bat` / `update.sh`（对应 `setup --update`）先 `git
+pull` 取最新代码，再重编/取新引擎、更新 Python 包与各模型的配置和 draft 子集；
+模型文件不动，之后用原启动脚本启动。0.1.38 起新增若干运行时行为：启动时
+打印所使用设置；6 GB 卡也能启动（引擎自选小卡 reserve，setup 只给提示，#496）；
+Linux 桌面 AMD 卡推荐 3072 MiB VRAM reserve（#560 #516）；"exceeds the context"
+的 400 会说明怎么绕过（#545）；回复达到 `max_new` 仍在思考时打日志并给建议
+（#530）。
 
 ## 6. 端到端请求流程
 
@@ -291,7 +326,8 @@ model 名 → alias → 真实模型，计算**推理预算**（`reasoning_effor
         │
         ▼  （客户端在 FIFO 上等待）
 [serve/server.py]
-   1. API key 检查（仅在 --api-key 设置时）
+   1. 安全门：Host 检查（DNS 重绑定；无 API 键时总是）+ 浏览器 Origin 检查
+      （`trusted_origins`/`cors_origins`）；随后 API 键检查（仅在设置时）
    2. 映射 model 名 → alias → 真实模型
    3. token 化会话  (chat_template.jinja)
    4. 解析推理预算 (reasoning_effort → tokens)
@@ -305,7 +341,8 @@ model 名 → alias → 真实模型，计算**推理预算**（`reasoning_effor
    9.  对每一层：
          QSA 层 → 全 attention（GPU）；  GDN 层 → DeltaNet mixer（GPU）
          MoE：路由选约 10 个专家
-             ├─ 在 GPU（专家缓存）→ 在 GPU 上跑
+             ├─ 主卡 GPU（专家缓存）→ 主卡跑
+             ├─ 第二卡（`--peer-device N`，peer_experts）→ P2P 映射内存
              └─ 缺失              → CPU 池并行计算
          （prefill：专家在 attention 运行期间从 RAM DMA 进显存；KV 流式）
         10. （投机：MTP/后缀出 k 个草稿 → 48 层校验 → 保留接受者）
@@ -338,6 +375,11 @@ model 名 → alias → 真实模型，计算**推理预算**（`reasoning_effor
    所有重的东西在 C++ 引擎或模型文件里。
 6. **可恢复的安装器。** Setup 记住它停在哪（下载、编译、配置、run-脚本），继续
    下去；第一次启动卡住是正常的（RAM 正在被锁定给 GPU）——等，别关。
+7. **默认对网络不信任。** 无 API 键时 Host 头校验拦 DNS 重绑定；带 `Origin`
+   的浏览器请求须命名允许的页面（`trusted_origins`/`cors_origins`）；只有配了
+   key 才免 Host 检查（重绑定页无法认证）。
+8. **计划必须说清代价。** 放不下就报"还剩多少显存"；"exceeds the context"
+   的 400 直接说怎么绕过；回复达 `max_new` 仍在思考时打日志并给建议。
 
 ## 8. 数字在哪里
 
